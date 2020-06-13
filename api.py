@@ -16,7 +16,6 @@ from email.header import Header, decode_header
 from email.mime.text import MIMEText
 from email.parser import BytesParser, BytesHeaderParser
 from email.utils import formataddr, formatdate, make_msgid
-from imapclient.imapclient import IMAPClient
 
 logging.basicConfig(filename="/tmp/iris-api.log", format="[%(asctime)s] %(message)s", level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S")
 
@@ -25,6 +24,46 @@ imap_host = imap_port = imap_login = imap_passwd = None
 smtp_host = smtp_port = smtp_login = smtp_passwd = None
 
 no_reply_pattern = r"^.*no[\-_ t]*reply"
+
+def get_service():
+    # Stolen from quickstart.py
+    import pickle
+    import os.path
+    from googleapiclient.discovery import build
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+
+    # If modifying these scopes, delete the file token.pickle.
+    SCOPES = [
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/gmail.send'
+    ]
+
+    """Shows basic usage of the Gmail API.
+    Lists the user's Gmail labels.
+    """
+    creds = None
+    # The file token.pickle stores the user's access and refresh tokens, and is
+    # created automatically when the authorization flow completes for the first
+    # time.
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    # If there are no (valid) credentials available, let the user log in.
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        # Save the credentials for the next run
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+
+    service = build('gmail', 'v1', credentials=creds)
+
+    return service
 
 def get_contacts():
     contacts = set()
@@ -36,50 +75,42 @@ def get_contacts():
 
     return list(contacts)
 
-def get_emails(last_seq, chunk_size):
-    global imap_client
+def get_emails(last_seq, chunk_size, service):
+    # TODO wire last_seq to pageToken, chunk_size to maxResults
 
     emails = []
     if last_seq == 0:
         return emails
 
-    ids = "%d:%d" % (last_seq, last_seq - chunk_size) if (last_seq > chunk_size) else "%d:%d" % (last_seq, 1)
-    fetch = imap_client.fetch(ids, ["FLAGS", "ENVELOPE", "INTERNALDATE", "BODY.PEEK[HEADER]", "BODYSTRUCTURE", "FLAGS"])
+    msg_ids = service.users().messages().list(userId='me', maxResults=50, pageToken=None).execute()
 
-    for [uid, data] in fetch.items():
-        header = BytesHeaderParser(policy=policy.default).parsebytes(data[b"BODY[HEADER]"])
-        envelope = data[b"ENVELOPE"]
-        logging.info(data[b"BODYSTRUCTURE"])
-        struct = data[b"BODYSTRUCTURE"][0] if isinstance(data[b"BODYSTRUCTURE"][0], list) else []
-        has_attachment = len([mime[0] for mime in struct if mime[0] and mime[0] not in [b"text", b"multipart"]]) > 0
-        subject = decode_byte(envelope.subject)
-        from_ = envelope.from_[0]
-        from_ = "@".join([decode_byte(from_.mailbox), decode_byte(from_.host)])
-        to = envelope.to[0]
-        to = "@".join([decode_byte(to.mailbox), decode_byte(to.host)])
-        date_ = data[b"INTERNALDATE"].strftime("%d/%m/%y, %Hh%M")
+    HDRS = ['From', 'To', 'Subject', 'Date', 'Message-ID', 'Reply-To'] 
+    for msg in msg_ids['messages']:
+        msg = service.users().messages().get(userId='me', id=msg['id'], format='metadata', metadataHeaders=HDRS).execute()
 
-        email = dict()
-        email["id"] = uid
-        email["subject"] = subject
-        email["from"] = from_
-        email["to"] = to
-        email["date"] = date_
-        email["flags"] = get_flags_str(data[b"FLAGS"], has_attachment)
-        email["message-id"] = envelope.message_id.decode()
-        email["reply-to"] = header["Reply-To"] if "Reply-To" in header else None
+        email = dict(id=msg['id'])
+
+        for hdr in msg['payload']['headers']:
+            email[hdr['name'].lower()] = hdr['value']
+
+        #TODO Flags / has_attachment
+        email["flags"] = "" # get_flags_str(data[b"FLAGS"], has_attachment)
 
         emails.insert(0, email)
 
     return emails
 
-def get_email(id, format):
-    global imap_client
+def get_email(id, format, service):
+    import base64
+    msg = service.users().messages().get(userId='me', id=id).execute()
+    #content = get_email_content(id, fetch.popitem()[1][b"BODY[]"])
 
-    fetch = imap_client.fetch([id], ["BODY[]"])
-    content = get_email_content(id, fetch.popitem()[1][b"BODY[]"])
+    if 'data' in msg['payload']['body'] :
+        payload = msg['payload']['body']['data']
+    else :
+        payload = msg['payload']['parts'][0]['body']['data']
 
-    return content[format]
+    return base64.urlsafe_b64decode( payload )
 
 def get_flags_str(flags, has_attachment):
     flags_str = ""
@@ -171,102 +202,101 @@ def decode_contact(contact):
 
     return "@".join([mailbox, host]).lower()
 
-while True:
-    request_raw = sys.stdin.readline()
+if __name__ == '__main__':
+    import fire
+    fire.Fire()
+    sys.exit(0)
 
-    try: request = json.loads(request_raw.rstrip())
-    except: continue
+def api():
+    service = None
 
-    logging.info("Receive: " + str({key: request[key] for key in request if key not in ["imap-passwd", "smtp-passwd"]}))
 
-    if request["type"] == "login":
-        try:
-            imap_host = request["imap-host"]
-            imap_port = request["imap-port"]
-            imap_login = request["imap-login"]
-            imap_passwd = request["imap-passwd"]
+    while True:
+        request_raw = sys.stdin.readline()
 
-            smtp_host = request["smtp-host"]
-            smtp_port = request["smtp-port"]
-            smtp_login = request["smtp-login"]
-            smtp_passwd = request["smtp-passwd"]
+        try: request = json.loads(request_raw.rstrip())
+        except: continue
 
-            imap_client = IMAPClient(host=imap_host, port=imap_port)
-            imap_client.login(imap_login, imap_passwd)
+        logging.info("Receive: " + str({key: request[key] for key in request if key not in ["imap-passwd", "smtp-passwd"]}))
 
-            folders = list(map(lambda folder: folder[2], imap_client.list_folders()))
+        if request["type"] == "login":
+            try:
+                service = get_service()
 
-            response = dict(success=True, type="login", folders=folders)
-        except Exception as error:
-            response = dict(success=False, type="login", error=str(error))
+                results = service.users().labels().list(userId='me').execute()
+                folders = results.get('labels', [])
 
-    elif request["type"] == "fetch-emails":
-        try:
-            emails = get_emails(request["seq"], request["chunk-size"])
-            response = dict(success=True, type="fetch-emails", emails=emails)
-        except Exception as error:
-            response = dict(success=False, type="fetch-emails", error=str(error))
+                response = dict(success=True, type="login", folders=folders)
+            except Exception as error:
+                response = dict(success=False, type="login", error=str(error))
 
-    elif request["type"] == "fetch-email":
-        try:
-            email = get_email(request["id"], request["format"])
-            response = dict(success=True, type="fetch-email", email=email, format=request["format"])
-        except Exception as error:
-            response = dict(success=False, type="fetch-email", error=str(error))
+        elif request["type"] == "fetch-emails":
+            try:
+                emails = get_emails(request["seq"], request["chunk-size"], service)
+                response = dict(success=True, type="fetch-emails", emails=emails)
+            except Exception as error:
+                response = dict(success=False, type="fetch-emails", error=str(error))
 
-    elif request["type"] == "download-attachments":
-        try:
-            fetch = imap_client.fetch([request["id"]], ["BODY[]"])
-            attachments = download_attachments(request["dir"], request["id"], fetch.popitem()[1][b"BODY[]"])
-            response = dict(success=True, type="download-attachments", attachments=attachments)
-        except Exception as error:
-            response = dict(success=False, type="download-attachments", error=str(error))
+        elif request["type"] == "fetch-email":
+            try:
+                email = get_email(request["id"], request["format"])
+                response = dict(success=True, type="fetch-email", email=email, format=request["format"])
+            except Exception as error:
+                response = dict(success=False, type="fetch-email", error=str(error))
 
-    elif request["type"] == "select-folder":
-        try:
-            folder = request["folder"]
-            seq = imap_client.select_folder(folder)[b"UIDNEXT"]
-            emails = get_emails(seq, request["chunk-size"])
-            is_folder_selected = True
-            response = dict(success=True, type="select-folder", folder=folder, seq=seq, emails=emails)
-        except Exception as error:
-            response = dict(success=False, type="select-folder", error=str(error))
+        elif request["type"] == "download-attachments":
+            try:
+                fetch = imap_client.fetch([request["id"]], ["BODY[]"])
+                attachments = download_attachments(request["dir"], request["id"], fetch.popitem()[1][b"BODY[]"])
+                response = dict(success=True, type="download-attachments", attachments=attachments)
+            except Exception as error:
+                response = dict(success=False, type="download-attachments", error=str(error))
 
-    elif request["type"] == "send-email":
-        try:
-            message = MIMEText(request["message"])
-            for key, val in request["headers"].items(): message[key] = val
-            message["From"] = formataddr((request["from"]["name"], request["from"]["email"]))
-            message["Message-Id"] = make_msgid()
+        elif request["type"] == "select-folder":
+            try:
+                folder = request["folder"]
+                seq = imap_client.select_folder(folder)[b"UIDNEXT"]
+                emails = get_emails(seq, request["chunk-size"])
+                is_folder_selected = True
+                response = dict(success=True, type="select-folder", folder=folder, seq=seq, emails=emails)
+            except Exception as error:
+                response = dict(success=False, type="select-folder", error=str(error))
 
-            smtp = smtplib.SMTP(host=smtp_host, port=smtp_port)
-            smtp.starttls()
-            smtp.login(smtp_login, smtp_passwd)
-            smtp.send_message(message)
-            smtp.quit()
+        elif request["type"] == "send-email":
+            try:
+                message = MIMEText(request["message"])
+                for key, val in request["headers"].items(): message[key] = val
+                message["From"] = formataddr((request["from"]["name"], request["from"]["email"]))
+                message["Message-Id"] = make_msgid()
 
-            imap_client.append("Sent", message.as_string())
+                smtp = smtplib.SMTP(host=smtp_host, port=smtp_port)
+                smtp.starttls()
+                smtp.login(smtp_login, smtp_passwd)
+                smtp.send_message(message)
+                smtp.quit()
 
-            contacts_file = open(os.path.dirname(sys.argv[0]) + "/.contacts", "a")
-            contacts_file.write(request["headers"]["To"] + "\n")
-            contacts_file.close()
+                imap_client.append("Sent", message.as_string())
 
-            response = dict(success=True, type="send-email")
-        except Exception as error:
-            response = dict(success=False, type="send-email", error=str(error))
+                contacts_file = open(os.path.dirname(sys.argv[0]) + "/.contacts", "a")
+                contacts_file.write(request["headers"]["To"] + "\n")
+                contacts_file.close()
 
-    elif request["type"] == "extract-contacts":
-        try:
-            contacts = get_contacts()
-            contacts_file = open(os.path.dirname(sys.argv[0]) + "/.contacts", "w+")
-            for contact in contacts: contacts_file.write(contact + "\n")
-            contacts_file.close()
+                response = dict(success=True, type="send-email")
+            except Exception as error:
+                response = dict(success=False, type="send-email", error=str(error))
 
-            response = dict(success=True, type="extract-contacts")
-        except Exception as error:
-            response = dict(success=False, type="extract-contacts", error=str(error))
+        elif request["type"] == "extract-contacts":
+            try:
+                contacts = get_contacts()
+                contacts_file = open(os.path.dirname(sys.argv[0]) + "/.contacts", "w+")
+                for contact in contacts: contacts_file.write(contact + "\n")
+                contacts_file.close()
 
-    json_response = json.dumps(response)
-    logging.info("Send: " + str(json_response))
-    sys.stdout.write(json_response + "\n")
-    sys.stdout.flush()
+                response = dict(success=True, type="extract-contacts")
+            except Exception as error:
+                response = dict(success=False, type="extract-contacts", error=str(error))
+
+        json_response = json.dumps(response)
+        logging.info("Send: " + str(json_response))
+        sys.stdout.write(json_response + "\n")
+        sys.stdout.flush()
